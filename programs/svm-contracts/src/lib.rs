@@ -229,6 +229,54 @@ pub mod svm_contracts {
 
         Ok(())
     }
+
+    pub fn claim_remaining_reward(ctx: Context<ClaimRemainingReward>) -> Result<()> {
+        require!(
+            !ctx.accounts.global_state.paused,
+            CustomError::ContractPaused
+        );
+
+        let quest = &mut ctx.accounts.quest;
+
+        // Only quest creator or admin can call this function
+        require!(
+            quest.creator == ctx.accounts.claimer.key()
+                || ctx.accounts.claimer.key() == ctx.accounts.global_state.owner,
+            CustomError::UnauthorizedWithdrawal
+        );
+
+        // Quest must be inactive (ended)
+        require!(!quest.is_active, CustomError::QuestNotActive);
+
+        // Must wait 1 week after quest deadline (7 days = 604800 seconds)
+        let current_timestamp = Clock::get()?.unix_timestamp;
+        require!(
+            current_timestamp >= quest.deadline + 604800,
+            CustomError::WithdrawalTooEarly
+        );
+
+        // Calculate remaining unclaimed amount
+        let remaining_amount = quest.amount - quest.total_reward_distributed;
+        require!(remaining_amount > 0, CustomError::NoTokensToWithdraw);
+
+        // Update the quest to prevent double claiming by setting amount to distributed amount
+        quest.amount = quest.total_reward_distributed;
+
+        // Transfer remaining tokens to creator
+        let signer_seeds: &[&[&[u8]]] = &[&[GLOBAL_STATE_SEED, &[ctx.bumps.global_state]]];
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.escrow_account.to_account_info(),
+                to: ctx.accounts.creator_token_account.to_account_info(),
+                authority: ctx.accounts.global_state.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token::transfer(transfer_ctx, remaining_amount)?;
+
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -269,6 +317,8 @@ pub enum CustomError {
     UnauthorizedWithdrawal,
     #[msg("No tokens to withdraw")]
     NoTokensToWithdraw,
+    #[msg("Must wait 1 week after quest deadline")]
+    WithdrawalTooEarly,
 }
 
 #[derive(Accounts)]
@@ -419,4 +469,31 @@ pub struct SendReward<'info> {
     pub reward_claimed: Account<'info, RewardClaimed>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRemainingReward<'info> {
+    #[account(mut)]
+    pub claimer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [GLOBAL_STATE_SEED],
+        bump,
+    )]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut)]
+    pub quest: Account<'info, Quest>,
+    #[account(
+        mut,
+        constraint = escrow_account.mint == quest.token_mint,
+        constraint = escrow_account.owner == global_state.key()
+    )]
+    pub escrow_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = creator_token_account.mint == quest.token_mint,
+        constraint = creator_token_account.owner == quest.creator
+    )]
+    pub creator_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
 }
