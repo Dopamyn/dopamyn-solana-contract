@@ -7,7 +7,7 @@ pub const PUBKEY_SIZE: usize = 32;
 pub const BOOL_SIZE: usize = 1;
 pub const VEC_LENGTH_SIZE: usize = 4;
 pub const MAX_SUPPORTED_TOKEN_MINTS: usize = 10;
-pub const MAX_QUESTS: usize = 100;
+pub const MAX_QUESTS: usize = 5000;
 pub const REWARD_CLAIMED_SPACE: usize = DISCRIMINATOR_SIZE + // discriminator
     PUBKEY_SIZE + // quest_id
     PUBKEY_SIZE + // winner
@@ -15,7 +15,7 @@ pub const REWARD_CLAIMED_SPACE: usize = DISCRIMINATOR_SIZE + // discriminator
     BOOL_SIZE; // claimed
 
 // Space constants for Quest
-pub const MAX_QUEST_ID_LENGTH: usize = 32;
+pub const MAX_QUEST_ID_LENGTH: usize = 36;
 pub const U64_SIZE: usize = 8;
 pub const U32_SIZE: usize = 4;
 

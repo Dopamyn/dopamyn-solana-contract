@@ -6,7 +6,7 @@ use constants::{
     GlobalState, Quest, GLOBAL_STATE_SEED, GLOBAL_STATE_SPACE, QUEST_SPACE, REWARD_CLAIMED_SPACE,
 };
 
-declare_id!("8JtK5RkLntLPujMLCuue7NZJXkoopoZWGA3kAp3dJNvL");
+declare_id!("43RRcJN1k3kVRDx4i3dNHtCEaY7NCZeaPJe7p7u6vcUd");
 
 #[program]
 pub mod svm_contracts {
