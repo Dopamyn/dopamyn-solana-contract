@@ -6,11 +6,11 @@ pub const DISCRIMINATOR_SIZE: usize = 8;
 pub const PUBKEY_SIZE: usize = 32;
 pub const BOOL_SIZE: usize = 1;
 pub const VEC_LENGTH_SIZE: usize = 4;
+pub const STRING_LENGTH_SIZE: usize = 4; // anchor serializes String as vec<u8> with 4-byte len
 pub const MAX_SUPPORTED_TOKEN_MINTS: usize = 10;
-pub const MAX_QUESTS: usize = 5000;
 pub const REWARD_CLAIMED_SPACE: usize = DISCRIMINATOR_SIZE + // discriminator
-    PUBKEY_SIZE + // quest_id
-    PUBKEY_SIZE + // winner
+    PUBKEY_SIZE + // quest (pubkey)
+    PUBKEY_SIZE + // winner (pubkey)
     U64_SIZE + // reward_amount
     BOOL_SIZE; // claimed
 
@@ -25,11 +25,10 @@ pub const GLOBAL_STATE_SPACE: usize = DISCRIMINATOR_SIZE + // discriminator
     BOOL_SIZE + // paused bool
     VEC_LENGTH_SIZE + // vec len for supported_token_mints
     (PUBKEY_SIZE * MAX_SUPPORTED_TOKEN_MINTS) + // space for up to 10 token mints
-    VEC_LENGTH_SIZE + // vec len for quests
-    (PUBKEY_SIZE * MAX_QUESTS); // space for up to 100 quest ids
+    U32_SIZE; // quest_count
 
 pub const QUEST_SPACE: usize = DISCRIMINATOR_SIZE + // discriminator
-    MAX_QUEST_ID_LENGTH + // id string (max)
+    STRING_LENGTH_SIZE + MAX_QUEST_ID_LENGTH + // id string (max)
     PUBKEY_SIZE + // creator pubkey
     PUBKEY_SIZE + // token mint pubkey
     PUBKEY_SIZE + // escrow account pubkey
@@ -45,7 +44,7 @@ pub struct GlobalState {
     pub owner: Pubkey,
     pub paused: bool,
     pub supported_token_mints: Vec<Pubkey>,
-    pub quests: Vec<String>,
+    pub quest_count: u32,
 }
 
 #[account]
@@ -64,7 +63,7 @@ pub struct Quest {
 
 #[account]
 pub struct RewardClaimed {
-    pub quest_id: String,
+    pub quest: Pubkey, // Using Pubkey instead of String for consistency
     pub winner: Pubkey,
     pub reward_amount: u64,
     pub claimed: bool,
