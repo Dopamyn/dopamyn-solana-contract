@@ -6,7 +6,7 @@ use constants::{
     GlobalState, Quest, GLOBAL_STATE_SEED, GLOBAL_STATE_SPACE, QUEST_SPACE, REWARD_CLAIMED_SPACE,
 };
 
-declare_id!("43RRcJN1k3kVRDx4i3dNHtCEaY7NCZeaPJe7p7u6vcUd");
+declare_id!("5cukA1JtwmSH7gboD3X3VGfgqQ4KE6sN5PPNctKLhhh8");
 
 #[program]
 pub mod svm_contracts {
@@ -17,7 +17,7 @@ pub mod svm_contracts {
         global_state.owner = ctx.accounts.owner.key();
         global_state.paused = false;
         global_state.supported_token_mints = supported_token_mints;
-        global_state.quests = Vec::new();
+        global_state.quest_count = 0;
         Ok(())
     }
 
@@ -64,7 +64,7 @@ pub mod svm_contracts {
         token::transfer(transfer_ctx, amount)?;
 
         let global_state = &mut ctx.accounts.global_state;
-        global_state.quests.push(id);
+        global_state.quest_count = global_state.quest_count.saturating_add(1);
 
         Ok(())
     }
@@ -75,7 +75,9 @@ pub mod svm_contracts {
 
     pub fn get_all_quests(ctx: Context<GetAllQuests>) -> Result<Vec<String>> {
         let global_state = &ctx.accounts.global_state;
-        Ok(global_state.quests.clone())
+        // NOTE: quests changed to Vec<Pubkey> for consistency. 
+        // This function is deprecated; prefer fetching quest accounts directly client-side.
+        Ok(Vec::new())
     }
 
     pub fn cancel_quest(ctx: Context<CancelQuest>) -> Result<()> {
@@ -179,6 +181,18 @@ pub mod svm_contracts {
         Ok(())
     }
 
+    pub fn set_owner(ctx: Context<SetOwner>, new_owner: Pubkey) -> Result<()> {
+        // Only current owner can rotate ownership
+        require!(
+            ctx.accounts.current_owner.key() == ctx.accounts.global_state.owner,
+            CustomError::UnauthorizedRewardAction
+        );
+
+        let global_state = &mut ctx.accounts.global_state;
+        global_state.owner = new_owner;
+        Ok(())
+    }
+
     pub fn send_reward(ctx: Context<SendReward>, reward_amount: u64) -> Result<()> {
         require!(
             !ctx.accounts.global_state.paused,
@@ -200,6 +214,18 @@ pub mod svm_contracts {
             CustomError::MaxWinnersReached
         );
 
+        // Validate winner token account (ATA) exists and is correct
+        // This provides clear error messages for missing ATAs before attempting transfer
+        let winner_token = &ctx.accounts.winner_token_account;
+        require!(
+            winner_token.mint == quest.token_mint,
+            CustomError::MissingAssociatedTokenAccount
+        );
+        require!(
+            winner_token.owner == ctx.accounts.winner.key(),
+            CustomError::MissingAssociatedTokenAccount
+        );
+
         // Check if winner has already claimed reward
         let reward_claimed_pda = &mut ctx.accounts.reward_claimed;
         require!(!reward_claimed_pda.claimed, CustomError::AlreadyRewarded);
@@ -209,7 +235,8 @@ pub mod svm_contracts {
         quest.total_winners += 1;
 
         // Initialize reward claimed account
-        reward_claimed_pda.quest_id = quest.id.clone();
+        // Note: quest.id is String, but RewardClaimed.quest stores Pubkey for consistency
+        reward_claimed_pda.quest = ctx.accounts.quest.key(); // Using quest.key() (Pubkey) instead of quest.id (String)
         reward_claimed_pda.winner = ctx.accounts.winner.key();
         reward_claimed_pda.reward_amount = reward_amount;
         reward_claimed_pda.claimed = true;
@@ -281,29 +308,29 @@ pub mod svm_contracts {
 
 #[error_code]
 pub enum CustomError {
-    #[msg(ERR_CONTRACT_PAUSED)]
+    #[msg("Contract is paused")]
     ContractPaused,
-    #[msg(ERR_UNSUPPORTED_TOKEN_MINT)]
+    #[msg("Unsupported token mint")]
     UnsupportedTokenMint,
-    #[msg(ERR_UNAUTHORIZED_CANCELLATION)]
+    #[msg("Unauthorized cancellation")]
     UnauthorizedCancellation,
-    #[msg(ERR_QUEST_NOT_ACTIVE)]
+    #[msg("Quest is not active")]
     QuestNotActive,
-    #[msg(ERR_QUEST_ALREADY_CANCELLED)]
+    #[msg("Quest already cancelled")]
     QuestAlreadyCancelled,
-    #[msg(ERR_UNAUTHORIZED_STATUS_UPDATE)]
+    #[msg("Unauthorized status update")]
     UnauthorizedStatusUpdate,
-    #[msg(ERR_UNAUTHORIZED_TOKEN_MODIFICATION)]
+    #[msg("Unauthorized token modification")]
     UnauthorizedTokenModification,
-    #[msg(ERR_TOKEN_ALREADY_SUPPORTED)]
+    #[msg("Token already supported")]
     TokenAlreadySupported,
-    #[msg(ERR_TOKEN_NOT_FOUND)]
+    #[msg("Token not found")]
     TokenNotFound,
-    #[msg(ERR_UNAUTHORIZED_PAUSE_ACTION)]
+    #[msg("Unauthorized pause action")]
     UnauthorizedPauseAction,
-    #[msg(ERR_ALREADY_PAUSED)]
+    #[msg("Already paused")]
     AlreadyPaused,
-    #[msg(ERR_ALREADY_UNPAUSED)]
+    #[msg("Already unpaused")]
     AlreadyUnpaused,
     #[msg("Unauthorized reward action")]
     UnauthorizedRewardAction,
@@ -319,6 +346,8 @@ pub enum CustomError {
     NoTokensToWithdraw,
     #[msg("Must wait 1 week after quest deadline")]
     WithdrawalTooEarly,
+    #[msg("Missing associated token account (ATA) for the provided owner/mint. Please create the ATA before sending rewards.")]
+    MissingAssociatedTokenAccount,
 }
 
 #[derive(Accounts)]
@@ -469,6 +498,18 @@ pub struct SendReward<'info> {
     pub reward_claimed: Account<'info, RewardClaimed>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetOwner<'info> {
+    #[account(mut)]
+    pub current_owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [GLOBAL_STATE_SEED],
+        bump,
+    )]
+    pub global_state: Account<'info, GlobalState>,
 }
 
 #[derive(Accounts)]
