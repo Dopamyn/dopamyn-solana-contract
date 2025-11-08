@@ -27,6 +27,75 @@ describe("svm-contracts", () => {
   let globalStatePDA: PublicKey;
   let supportedTokenMint: Keypair;
 
+  // Helper function to airdrop SOL only if needed
+  async function airdropIfNeeded(
+    publicKey: PublicKey,
+    amount: number = 2 * anchor.web3.LAMPORTS_PER_SOL
+  ): Promise<void> {
+    try {
+      const balance = await provider.connection.getBalance(publicKey);
+      if (balance >= amount) {
+        return; // Already has enough SOL
+      }
+
+      // Request airdrop with retry logic
+      let retries = 3;
+      let delay = 1000;
+      while (retries > 0) {
+        try {
+          const signature = await provider.connection.requestAirdrop(
+            publicKey,
+            amount
+          );
+          await provider.connection.confirmTransaction(signature);
+          return;
+        } catch (error: any) {
+          if (
+            error.message?.includes("429") ||
+            error.message?.includes("Too Many Requests")
+          ) {
+            retries--;
+            if (retries > 0) {
+              console.log(`Rate limited, retrying after ${delay}ms...`);
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              delay *= 2; // Exponential backoff
+            } else {
+              // If we've exhausted retries, check if we have enough balance anyway
+              const currentBalance = await provider.connection.getBalance(
+                publicKey
+              );
+              if (currentBalance >= amount * 0.5) {
+                console.log(
+                  `Using existing balance: ${
+                    currentBalance / anchor.web3.LAMPORTS_PER_SOL
+                  } SOL`
+                );
+                return;
+              }
+              throw new Error(
+                `Failed to airdrop after retries: ${error.message}`
+              );
+            }
+          } else {
+            throw error;
+          }
+        }
+      }
+    } catch (error) {
+      // If airdrop fails, check if we have enough balance anyway
+      const balance = await provider.connection.getBalance(publicKey);
+      if (balance >= amount * 0.5) {
+        console.log(
+          `Using existing balance: ${
+            balance / anchor.web3.LAMPORTS_PER_SOL
+          } SOL`
+        );
+        return;
+      }
+      throw error;
+    }
+  }
+
   before(async () => {
     // Get global state PDA
     [globalStatePDA] = anchor.web3.PublicKey.findProgramAddressSync(
@@ -35,11 +104,7 @@ describe("svm-contracts", () => {
     );
 
     // Airdrop SOL to owner for transaction fees
-    const signature = await provider.connection.requestAirdrop(
-      owner.publicKey,
-      2 * anchor.web3.LAMPORTS_PER_SOL
-    );
-    await provider.connection.confirmTransaction(signature);
+    await airdropIfNeeded(owner.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
   });
 
   describe("initialize", () => {
@@ -204,11 +269,10 @@ describe("svm-contracts", () => {
     it("should not allow non-owner to add supported token", async () => {
       const nonOwner = Keypair.generate();
       const newTokenMint = Keypair.generate();
-      const signature = await provider.connection.requestAirdrop(
+      await airdropIfNeeded(
         nonOwner.publicKey,
         2 * anchor.web3.LAMPORTS_PER_SOL
       );
-      await provider.connection.confirmTransaction(signature);
 
       try {
         await program.methods
@@ -256,11 +320,10 @@ describe("svm-contracts", () => {
 
     it("should not allow non-owner to pause contract", async () => {
       const nonOwner = Keypair.generate();
-      const signature = await provider.connection.requestAirdrop(
+      await airdropIfNeeded(
         nonOwner.publicKey,
         2 * anchor.web3.LAMPORTS_PER_SOL
       );
-      await provider.connection.confirmTransaction(signature);
 
       try {
         await program.methods
@@ -458,8 +521,9 @@ describe("svm-contracts", () => {
         .view();
 
       expect(allQuests).to.be.an("array");
-      expect(allQuests).to.have.lengthOf(1);
-      expect(allQuests[0]).to.equal(questId);
+      // Note: getAllQuests is deprecated and returns empty array
+      // Quest accounts should be fetched directly client-side
+      expect(allQuests).to.have.lengthOf(0);
     });
 
     it("should fail to create quest with unsupported token mint", async () => {
@@ -541,11 +605,10 @@ describe("svm-contracts", () => {
 
     it("should not allow non-creator to cancel quest", async () => {
       const nonCreator = Keypair.generate();
-      const signature = await provider.connection.requestAirdrop(
+      await airdropIfNeeded(
         nonCreator.publicKey,
         2 * anchor.web3.LAMPORTS_PER_SOL
       );
-      await provider.connection.confirmTransaction(signature);
 
       try {
         await program.methods
@@ -579,11 +642,10 @@ describe("svm-contracts", () => {
 
     it("should not allow non-owner to update quest status", async () => {
       const nonOwner = Keypair.generate();
-      const signature = await provider.connection.requestAirdrop(
+      await airdropIfNeeded(
         nonOwner.publicKey,
         2 * anchor.web3.LAMPORTS_PER_SOL
       );
-      await provider.connection.confirmTransaction(signature);
 
       try {
         await program.methods
@@ -618,11 +680,10 @@ describe("svm-contracts", () => {
 
         // Setup winner account
         winner = Keypair.generate();
-        const signature = await provider.connection.requestAirdrop(
+        await airdropIfNeeded(
           winner.publicKey,
           2 * anchor.web3.LAMPORTS_PER_SOL
         );
-        await provider.connection.confirmTransaction(signature);
 
         // Create winner's Associated Token Account
         winnerTokenAccount = await getAssociatedTokenAddress(
@@ -730,7 +791,9 @@ describe("svm-contracts", () => {
         expect(quest.totalWinners.toString()).to.equal("1");
 
         // Verify reward claimed state
-        expect(rewardClaimed.questId).to.equal("reward-test-quest");
+        expect(rewardClaimed.quest.toString()).to.equal(
+          questKeypair.publicKey.toString()
+        );
         expect(rewardClaimed.winner.toString()).to.equal(
           winner.publicKey.toString()
         );
@@ -795,11 +858,10 @@ describe("svm-contracts", () => {
 
       it("should not allow non-owner to send reward", async () => {
         const nonOwner = Keypair.generate();
-        const signature = await provider.connection.requestAirdrop(
+        await airdropIfNeeded(
           nonOwner.publicKey,
           2 * anchor.web3.LAMPORTS_PER_SOL
         );
-        await provider.connection.confirmTransaction(signature);
 
         const newWinner = Keypair.generate();
         const [rewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
@@ -1144,11 +1206,10 @@ describe("svm-contracts", () => {
 
       it("should not allow non-creator and non-admin to claim remaining reward", async () => {
         const nonCreator = Keypair.generate();
-        const signature = await provider.connection.requestAirdrop(
+        await airdropIfNeeded(
           nonCreator.publicKey,
           2 * anchor.web3.LAMPORTS_PER_SOL
         );
-        await provider.connection.confirmTransaction(signature);
 
         try {
           await program.methods
@@ -1307,11 +1368,10 @@ describe("svm-contracts", () => {
         const winner = Keypair.generate();
 
         // Airdrop SOL to winner for transaction fees
-        const signature = await provider.connection.requestAirdrop(
+        await airdropIfNeeded(
           winner.publicKey,
           2 * anchor.web3.LAMPORTS_PER_SOL
         );
-        await provider.connection.confirmTransaction(signature);
 
         const winnerTokenAccount = await getAssociatedTokenAddress(
           supportedTokenMint.publicKey,
@@ -1428,6 +1488,673 @@ describe("svm-contracts", () => {
           })
           .signers([owner])
           .rpc();
+      });
+    });
+
+    describe("close reward claimed", () => {
+      let closeQuestKeypair: Keypair;
+      let closeEscrowPDA: PublicKey;
+      let closeCreatorTokenAccount: PublicKey;
+      let closeWinner: Keypair;
+      let closeWinnerTokenAccount: PublicKey;
+      let closeRewardClaimedPDA: PublicKey;
+      let closeRewardAmount: anchor.BN;
+
+      before(async () => {
+        // Create a new quest for closing tests
+        closeQuestKeypair = Keypair.generate();
+        [closeEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), closeQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        // Create Associated Token Account for creator
+        closeCreatorTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          owner.publicKey
+        );
+
+        // Create the ATA if it doesn't exist
+        try {
+          await getAccount(provider.connection, closeCreatorTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            owner.publicKey,
+            closeCreatorTokenAccount,
+            owner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [owner]);
+        }
+
+        // Mint tokens to creator account
+        await mintTo(
+          provider.connection,
+          owner,
+          supportedTokenMint.publicKey,
+          closeCreatorTokenAccount,
+          owner,
+          2000000000
+        );
+
+        // Create quest
+        closeRewardAmount = new anchor.BN(500000);
+        const closeDeadline = new anchor.BN(Date.now() / 1000 + 86400); // 1 day from now
+
+        await program.methods
+          .createQuest("close-test-quest", closeRewardAmount, closeDeadline, 5)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: closeEscrowPDA,
+            creatorTokenAccount: closeCreatorTokenAccount,
+            quest: closeQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, closeQuestKeypair])
+          .rpc();
+
+        // Create winner and send reward
+        closeWinner = Keypair.generate();
+        await airdropIfNeeded(
+          closeWinner.publicKey,
+          2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+
+        closeWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          closeWinner.publicKey
+        );
+
+        // Create winner ATA if it doesn't exist
+        try {
+          await getAccount(provider.connection, closeWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            closeWinner.publicKey,
+            closeWinnerTokenAccount,
+            closeWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [closeWinner]);
+        }
+
+        [closeRewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("reward_claimed"),
+            closeQuestKeypair.publicKey.toBuffer(),
+            closeWinner.publicKey.toBuffer(),
+          ],
+          program.programId
+        );
+
+        // Send reward to create the RewardClaimed PDA
+        await program.methods
+          .sendReward(closeRewardAmount)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: closeQuestKeypair.publicKey,
+            escrowAccount: closeEscrowPDA,
+            winner: closeWinner.publicKey,
+            winnerTokenAccount: closeWinnerTokenAccount,
+            rewardClaimed: closeRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+      });
+
+      it("should allow owner to close RewardClaimed PDA and reclaim SOL", async () => {
+        // Create a new quest and reward for this specific test
+        const ownerCloseQuestKeypair = Keypair.generate();
+        const [ownerCloseEscrowPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("escrow"),
+              ownerCloseQuestKeypair.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        await mintTo(
+          provider.connection,
+          owner,
+          supportedTokenMint.publicKey,
+          closeCreatorTokenAccount,
+          owner,
+          1000000000
+        );
+
+        const ownerCloseDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+        await program.methods
+          .createQuest(
+            "owner-close-test",
+            closeRewardAmount,
+            ownerCloseDeadline,
+            5
+          )
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: ownerCloseEscrowPDA,
+            creatorTokenAccount: closeCreatorTokenAccount,
+            quest: ownerCloseQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, ownerCloseQuestKeypair])
+          .rpc();
+
+        const ownerCloseWinner = Keypair.generate();
+        await airdropIfNeeded(
+          ownerCloseWinner.publicKey,
+          2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+
+        const ownerCloseWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          ownerCloseWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, ownerCloseWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            ownerCloseWinner.publicKey,
+            ownerCloseWinnerTokenAccount,
+            ownerCloseWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [ownerCloseWinner]);
+        }
+
+        const [ownerCloseRewardClaimedPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("reward_claimed"),
+              ownerCloseQuestKeypair.publicKey.toBuffer(),
+              ownerCloseWinner.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        // Send reward
+        await program.methods
+          .sendReward(closeRewardAmount)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: ownerCloseQuestKeypair.publicKey,
+            escrowAccount: ownerCloseEscrowPDA,
+            winner: ownerCloseWinner.publicKey,
+            winnerTokenAccount: ownerCloseWinnerTokenAccount,
+            rewardClaimed: ownerCloseRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        // Get admin (owner) balance before closing
+        const adminBalanceBefore = await provider.connection.getBalance(
+          owner.publicKey
+        );
+
+        // Verify the RewardClaimed PDA exists
+        const rewardClaimedBefore = await program.account.rewardClaimed.fetch(
+          ownerCloseRewardClaimedPDA
+        );
+        expect(rewardClaimedBefore.claimed).to.be.true;
+
+        // Get account balance before closing
+        const accountInfoBefore = await provider.connection.getAccountInfo(
+          ownerCloseRewardClaimedPDA
+        );
+        const rentAmount = accountInfoBefore?.lamports || 0;
+
+        console.log("Before closing RewardClaimed PDA (admin):");
+        console.log("Admin balance:", adminBalanceBefore.toString());
+        console.log("RewardClaimed PDA balance:", rentAmount.toString());
+
+        // Close the PDA as admin (owner) and reclaim SOL to admin's account
+        await program.methods
+          .closeRewardClaimed()
+          .accounts({
+            closer: owner.publicKey,
+            globalState: globalStatePDA,
+            rewardClaimed: ownerCloseRewardClaimedPDA,
+            quest: ownerCloseQuestKeypair.publicKey,
+            winner: ownerCloseWinner.publicKey,
+            recipient: owner.publicKey, // Admin reclaims SOL to their own account
+          })
+          .signers([owner])
+          .rpc();
+
+        // Verify the account is closed
+        const accountInfoAfter = await provider.connection.getAccountInfo(
+          ownerCloseRewardClaimedPDA
+        );
+        expect(accountInfoAfter).to.be.null;
+
+        // Verify SOL was returned to admin
+        const adminBalanceAfter = await provider.connection.getBalance(
+          owner.publicKey
+        );
+
+        console.log("After closing RewardClaimed PDA (admin):");
+        console.log("Admin balance:", adminBalanceAfter.toString());
+        console.log(
+          "SOL reclaimed:",
+          (adminBalanceAfter - adminBalanceBefore).toString()
+        );
+
+        expect(adminBalanceAfter).to.be.greaterThan(adminBalanceBefore);
+        expect(adminBalanceAfter - adminBalanceBefore).to.be.greaterThan(0);
+      });
+
+      it("should allow winner to close their own RewardClaimed PDA", async () => {
+        // Create another quest and reward for this test
+        const testQuestKeypair = Keypair.generate();
+        const [testEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), testQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        // Mint tokens
+        await mintTo(
+          provider.connection,
+          owner,
+          supportedTokenMint.publicKey,
+          closeCreatorTokenAccount,
+          owner,
+          1000000000
+        );
+
+        const testDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+        await program.methods
+          .createQuest("close-winner-test", closeRewardAmount, testDeadline, 5)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: testEscrowPDA,
+            creatorTokenAccount: closeCreatorTokenAccount,
+            quest: testQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, testQuestKeypair])
+          .rpc();
+
+        // Create another winner
+        const testWinner = Keypair.generate();
+        await airdropIfNeeded(
+          testWinner.publicKey,
+          2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+
+        const testWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          testWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, testWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            testWinner.publicKey,
+            testWinnerTokenAccount,
+            testWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [testWinner]);
+        }
+
+        const [testRewardClaimedPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("reward_claimed"),
+              testQuestKeypair.publicKey.toBuffer(),
+              testWinner.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        // Send reward
+        await program.methods
+          .sendReward(closeRewardAmount)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: testQuestKeypair.publicKey,
+            escrowAccount: testEscrowPDA,
+            winner: testWinner.publicKey,
+            winnerTokenAccount: testWinnerTokenAccount,
+            rewardClaimed: testRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        // Get winner balance before closing
+        const winnerBalanceBefore = await provider.connection.getBalance(
+          testWinner.publicKey
+        );
+
+        // Get account balance before closing
+        const accountInfoBefore = await provider.connection.getAccountInfo(
+          testRewardClaimedPDA
+        );
+        const rentAmount = accountInfoBefore?.lamports || 0;
+
+        console.log("Before closing RewardClaimed PDA (winner):");
+        console.log("Winner balance:", winnerBalanceBefore.toString());
+        console.log("RewardClaimed PDA balance:", rentAmount.toString());
+
+        // Close as winner
+        await program.methods
+          .closeRewardClaimed()
+          .accounts({
+            closer: testWinner.publicKey,
+            globalState: globalStatePDA,
+            rewardClaimed: testRewardClaimedPDA,
+            quest: testQuestKeypair.publicKey,
+            winner: testWinner.publicKey,
+            recipient: testWinner.publicKey, // Winner receives the SOL
+          })
+          .signers([testWinner])
+          .rpc();
+
+        // Verify account is closed
+        const accountInfoAfter = await provider.connection.getAccountInfo(
+          testRewardClaimedPDA
+        );
+        expect(accountInfoAfter).to.be.null;
+
+        // Verify winner received SOL
+        const winnerBalanceAfter = await provider.connection.getBalance(
+          testWinner.publicKey
+        );
+
+        console.log("After closing RewardClaimed PDA (winner):");
+        console.log("Winner balance:", winnerBalanceAfter.toString());
+        console.log(
+          "SOL reclaimed:",
+          (winnerBalanceAfter - winnerBalanceBefore).toString()
+        );
+
+        expect(winnerBalanceAfter).to.be.greaterThan(winnerBalanceBefore);
+      });
+
+      it("should not allow unauthorized user to close RewardClaimed PDA", async () => {
+        // Create another quest and reward
+        const unauthorizedQuestKeypair = Keypair.generate();
+        const [unauthorizedEscrowPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("escrow"),
+              unauthorizedQuestKeypair.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        await mintTo(
+          provider.connection,
+          owner,
+          supportedTokenMint.publicKey,
+          closeCreatorTokenAccount,
+          owner,
+          1000000000
+        );
+
+        const unauthorizedDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+        await program.methods
+          .createQuest(
+            "unauthorized-close-test",
+            closeRewardAmount,
+            unauthorizedDeadline,
+            5
+          )
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: unauthorizedEscrowPDA,
+            creatorTokenAccount: closeCreatorTokenAccount,
+            quest: unauthorizedQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, unauthorizedQuestKeypair])
+          .rpc();
+
+        const unauthorizedWinner = Keypair.generate();
+        const unauthorizedWinner2 = Keypair.generate();
+        await airdropIfNeeded(
+          unauthorizedWinner.publicKey,
+          2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+
+        const unauthorizedWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          unauthorizedWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, unauthorizedWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            unauthorizedWinner.publicKey,
+            unauthorizedWinnerTokenAccount,
+            unauthorizedWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [unauthorizedWinner]);
+        }
+
+        const [unauthorizedRewardClaimedPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("reward_claimed"),
+              unauthorizedQuestKeypair.publicKey.toBuffer(),
+              unauthorizedWinner.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        // Send reward
+        await program.methods
+          .sendReward(closeRewardAmount)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: unauthorizedQuestKeypair.publicKey,
+            escrowAccount: unauthorizedEscrowPDA,
+            winner: unauthorizedWinner.publicKey,
+            winnerTokenAccount: unauthorizedWinnerTokenAccount,
+            rewardClaimed: unauthorizedRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        // Get balances before unauthorized close attempt
+        const unauthorizedBalanceBefore = await provider.connection.getBalance(
+          unauthorizedWinner2.publicKey
+        );
+        const accountInfoBefore = await provider.connection.getAccountInfo(
+          unauthorizedRewardClaimedPDA
+        );
+        const rentAmount = accountInfoBefore?.lamports || 0;
+
+        console.log("Before unauthorized close attempt:");
+        console.log(
+          "Unauthorized user balance:",
+          unauthorizedBalanceBefore.toString()
+        );
+        console.log("RewardClaimed PDA balance:", rentAmount.toString());
+
+        // Try to close as unauthorized user (different winner)
+        try {
+          await program.methods
+            .closeRewardClaimed()
+            .accounts({
+              closer: unauthorizedWinner2.publicKey,
+              globalState: globalStatePDA,
+              rewardClaimed: unauthorizedRewardClaimedPDA,
+              quest: unauthorizedQuestKeypair.publicKey,
+              winner: unauthorizedWinner.publicKey,
+              recipient: unauthorizedWinner2.publicKey,
+            })
+            .signers([unauthorizedWinner2])
+            .rpc();
+          expect.fail("Expected the transaction to fail");
+        } catch (error: any) {
+          expect(error).to.exist;
+          // Verify the account still exists
+          const accountInfo = await provider.connection.getAccountInfo(
+            unauthorizedRewardClaimedPDA
+          );
+          expect(accountInfo).to.not.be.null;
+
+          const unauthorizedBalanceAfter = await provider.connection.getBalance(
+            unauthorizedWinner2.publicKey
+          );
+
+          console.log("After unauthorized close attempt (failed):");
+          console.log(
+            "Unauthorized user balance:",
+            unauthorizedBalanceAfter.toString()
+          );
+          console.log(
+            "RewardClaimed PDA still exists with balance:",
+            accountInfo?.lamports?.toString() || "0"
+          );
+        }
+      });
+
+      it("should allow querying RewardClaimed info", async () => {
+        // Create a quest and reward for query test
+        const queryQuestKeypair = Keypair.generate();
+        const [queryEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), queryQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        await mintTo(
+          provider.connection,
+          owner,
+          supportedTokenMint.publicKey,
+          closeCreatorTokenAccount,
+          owner,
+          1000000000
+        );
+
+        const queryDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+        await program.methods
+          .createQuest("query-test", closeRewardAmount, queryDeadline, 5)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: queryEscrowPDA,
+            creatorTokenAccount: closeCreatorTokenAccount,
+            quest: queryQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, queryQuestKeypair])
+          .rpc();
+
+        const queryWinner = Keypair.generate();
+        await airdropIfNeeded(
+          queryWinner.publicKey,
+          2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+
+        const queryWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          queryWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, queryWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            queryWinner.publicKey,
+            queryWinnerTokenAccount,
+            queryWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [queryWinner]);
+        }
+
+        const [queryRewardClaimedPDA] =
+          anchor.web3.PublicKey.findProgramAddressSync(
+            [
+              Buffer.from("reward_claimed"),
+              queryQuestKeypair.publicKey.toBuffer(),
+              queryWinner.publicKey.toBuffer(),
+            ],
+            program.programId
+          );
+
+        // Send reward
+        await program.methods
+          .sendReward(closeRewardAmount)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: queryQuestKeypair.publicKey,
+            escrowAccount: queryEscrowPDA,
+            winner: queryWinner.publicKey,
+            winnerTokenAccount: queryWinnerTokenAccount,
+            rewardClaimed: queryRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        // Query the RewardClaimed info
+        const rewardClaimedInfo = await program.methods
+          .getRewardClaimedInfo()
+          .accounts({
+            rewardClaimed: queryRewardClaimedPDA,
+            quest: queryQuestKeypair.publicKey,
+            winner: queryWinner.publicKey,
+          })
+          .view();
+
+        expect(rewardClaimedInfo).to.exist;
+        expect(rewardClaimedInfo.quest.toString()).to.equal(
+          queryQuestKeypair.publicKey.toString()
+        );
+        expect(rewardClaimedInfo.winner.toString()).to.equal(
+          queryWinner.publicKey.toString()
+        );
+        expect(rewardClaimedInfo.rewardAmount.toString()).to.equal(
+          closeRewardAmount.toString()
+        );
+        expect(rewardClaimedInfo.claimed).to.be.true;
       });
     });
   });

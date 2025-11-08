@@ -57,16 +57,19 @@ The program implements a quest reward system where:
 
 - Users can create quests with token rewards
 - Quest creators deposit tokens into escrow accounts
-- Only the contract owner can distribute rewards to winners
-- Winners can only claim rewards once per quest
-- Quest creators can cancel quests and reclaim their tokens
+- Only the contract owner can distribute rewards to winners via `send_reward`
+- Each winner can only receive a reward once per quest (tracked via RewardClaimed PDA)
+- Quest creators can cancel active quests and reclaim their tokens
+- Quest creators or admins can claim remaining unclaimed rewards after quest ends (1 week cooldown)
+- Contract owner or winners can close RewardClaimed PDAs to reclaim rent-exempt SOL
+- Contract owner can pause/unpause the contract, manage supported tokens, update quest status, and transfer ownership
 
 ### Program ID
 
-Current program ID on devnet:
+Current program ID:
 
 ```
-43RRcJN1k3kVRDx4i3dNHtCEaY7NCZeaPJe7p7u6vcUd
+5cukA1JtwmSH7gboD3X3VGfgqQ4KE6sN5PPNctKLhhh8
 ```
 
 ## Modifying and Deploying the Program
@@ -106,7 +109,6 @@ solana-keygen new
 
 3. Important constants to consider when modifying:
    - `MAX_SUPPORTED_TOKEN_MINTS`: Maximum number of supported token mints (currently 10)
-   - `MAX_QUESTS`: Maximum number of quests (currently 100)
    - `MAX_QUEST_ID_LENGTH`: Maximum length of quest IDs (currently 36)
 
 ### 3. Testing Changes
@@ -184,7 +186,7 @@ pub struct GlobalState {
     pub owner: Pubkey,
     pub paused: bool,
     pub supported_token_mints: Vec<Pubkey>,
-    pub quests: Vec<String>,
+    pub quest_count: u32,
 }
 ```
 
@@ -209,7 +211,7 @@ pub struct Quest {
 
 ```rust
 pub struct RewardClaimed {
-    pub quest_id: String,
+    pub quest: Pubkey, // Quest account pubkey (not quest ID string)
     pub winner: Pubkey,
     pub reward_amount: u64,
     pub claimed: bool,
@@ -240,9 +242,12 @@ pub struct RewardClaimed {
 
 1. **Access Control**
 
-   - Only contract owner can distribute rewards
+   - Only contract owner can distribute rewards via `send_reward`
    - Quest creators can only cancel their own quests
-   - Winners can only claim rewards once per quest
+   - Each winner can only receive a reward once per quest (enforced via RewardClaimed PDA)
+   - Only contract owner can pause/unpause, modify supported tokens, update quest status, and transfer ownership
+   - Quest creators or contract owner can claim remaining rewards after quest ends (with 1 week cooldown)
+   - Contract owner or winner can close RewardClaimed PDAs to reclaim rent-exempt SOL
 
 2. **Token Safety**
 
@@ -254,6 +259,100 @@ pub struct RewardClaimed {
    - Quest state transitions are strictly controlled
    - Deadline checks prevent early withdrawals
    - Pausing mechanism for emergency stops
+
+4. **Account Cleanup**
+   - RewardClaimed PDAs can be closed by owner or winner to reclaim SOL
+   - Only authorized parties (owner or winner) can close RewardClaimed accounts
+   - Closed accounts return rent-exempt SOL to the specified recipient
+
+## Reclaiming SOL from RewardClaimed PDAs
+
+When rewards are distributed, `RewardClaimed` PDAs are created to track which winners have received rewards. These PDAs lock rent-exempt SOL. To reclaim this SOL, you can use the `close_reward_claimed` function.
+
+### Closing a Single RewardClaimed PDA
+
+```typescript
+import { Program } from "@coral-xyz/anchor";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import { SvmContracts } from "./target/types/svm_contracts";
+
+// Close a specific RewardClaimed PDA
+const [rewardClaimedPDA] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("reward_claimed"),
+    questPublicKey.toBuffer(),
+    winnerPublicKey.toBuffer(),
+  ],
+  program.programId
+);
+
+await program.methods
+  .closeRewardClaimed()
+  .accounts({
+    closer: owner.publicKey, // Must be owner or winner
+    globalState: globalStatePDA,
+    rewardClaimed: rewardClaimedPDA,
+    quest: questPublicKey,
+    winner: winnerPublicKey,
+    recipient: recipientPublicKey, // Receives the SOL
+  })
+  .signers([owner])
+  .rpc();
+```
+
+### Querying and Closing All RewardClaimed PDAs
+
+Use the provided script to find and close all RewardClaimed PDAs:
+
+```typescript
+import {
+  queryAllRewardClaimedPDAs,
+  closeAllRewardClaimedPDAs,
+} from "./scripts/query-and-close-reward-claimed";
+
+// Query all RewardClaimed PDAs
+const accounts = await queryAllRewardClaimedPDAs(program);
+console.log(`Found ${accounts.length} RewardClaimed PDAs`);
+
+// Close all PDAs as owner
+const results = await closeAllRewardClaimedPDAs(
+  program,
+  ownerKeypair,
+  recipientPublicKey
+);
+
+results.forEach((result) => {
+  if (result.error) {
+    console.error(`Failed: ${result.address.toString()} - ${result.error}`);
+  } else {
+    console.log(`Success: ${result.address.toString()} - TX: ${result.tx}`);
+  }
+});
+```
+
+### Authorization
+
+- **Contract Owner**: Can close any RewardClaimed PDA
+- **Winner**: Can close their own RewardClaimed PDA
+- **Unauthorized users**: Cannot close RewardClaimed PDAs
+
+### Querying RewardClaimed Info
+
+```typescript
+const rewardClaimedInfo = await program.methods
+  .getRewardClaimedInfo()
+  .accounts({
+    rewardClaimed: rewardClaimedPDA,
+    quest: questPublicKey,
+    winner: winnerPublicKey,
+  })
+  .view();
+
+console.log("Quest:", rewardClaimedInfo.quest.toString());
+console.log("Winner:", rewardClaimedInfo.winner.toString());
+console.log("Reward Amount:", rewardClaimedInfo.rewardAmount.toString());
+console.log("Claimed:", rewardClaimedInfo.claimed);
+```
 
 ## Contributing
 

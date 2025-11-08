@@ -6,7 +6,7 @@ use constants::{
     GlobalState, Quest, GLOBAL_STATE_SEED, GLOBAL_STATE_SPACE, QUEST_SPACE, REWARD_CLAIMED_SPACE,
 };
 
-declare_id!("5cukA1JtwmSH7gboD3X3VGfgqQ4KE6sN5PPNctKLhhh8");
+declare_id!("DRZkDTej9HHkd8NgBdG76C4dFa3wFmbqBT7Sfd5kW7Ky");
 
 #[program]
 pub mod svm_contracts {
@@ -75,7 +75,7 @@ pub mod svm_contracts {
 
     pub fn get_all_quests(ctx: Context<GetAllQuests>) -> Result<Vec<String>> {
         let global_state = &ctx.accounts.global_state;
-        // NOTE: quests changed to Vec<Pubkey> for consistency. 
+        // NOTE: quests changed to Vec<Pubkey> for consistency.
         // This function is deprecated; prefer fetching quest accounts directly client-side.
         Ok(Vec::new())
     }
@@ -304,6 +304,28 @@ pub mod svm_contracts {
 
         Ok(())
     }
+
+    pub fn get_reward_claimed_info(ctx: Context<GetRewardClaimedInfo>) -> Result<RewardClaimed> {
+        Ok((*ctx.accounts.reward_claimed).clone())
+    }
+
+    pub fn close_reward_claimed(ctx: Context<CloseRewardClaimed>) -> Result<()> {
+        let reward_claimed = &ctx.accounts.reward_claimed;
+
+        // Verify that the reward was actually claimed
+        require!(reward_claimed.claimed, CustomError::RewardNotClaimed);
+
+        // Only owner or the winner who claimed the reward can close
+        require!(
+            ctx.accounts.closer.key() == ctx.accounts.global_state.owner
+                || ctx.accounts.closer.key() == reward_claimed.winner,
+            CustomError::UnauthorizedClosure
+        );
+
+        // The close constraint will handle closing the account and returning SOL to recipient
+        // No additional logic needed - Anchor's close constraint handles everything
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -348,6 +370,10 @@ pub enum CustomError {
     WithdrawalTooEarly,
     #[msg("Missing associated token account (ATA) for the provided owner/mint. Please create the ATA before sending rewards.")]
     MissingAssociatedTokenAccount,
+    #[msg("Reward has not been claimed yet")]
+    RewardNotClaimed,
+    #[msg("Unauthorized to close this reward claimed account")]
+    UnauthorizedClosure,
 }
 
 #[derive(Accounts)]
@@ -537,4 +563,43 @@ pub struct ClaimRemainingReward<'info> {
     )]
     pub creator_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct GetRewardClaimedInfo<'info> {
+    #[account(
+        seeds = [b"reward_claimed", quest.key().as_ref(), winner.key().as_ref()],
+        bump
+    )]
+    pub reward_claimed: Account<'info, RewardClaimed>,
+    /// CHECK: Quest account is only used for PDA derivation
+    pub quest: AccountInfo<'info>,
+    /// CHECK: Winner account is only used for PDA derivation
+    pub winner: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CloseRewardClaimed<'info> {
+    #[account(mut)]
+    pub closer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [GLOBAL_STATE_SEED],
+        bump,
+    )]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(
+        mut,
+        close = recipient,
+        seeds = [b"reward_claimed", quest.key().as_ref(), winner.key().as_ref()],
+        bump
+    )]
+    pub reward_claimed: Account<'info, RewardClaimed>,
+    /// CHECK: Quest account is only used for PDA derivation
+    pub quest: AccountInfo<'info>,
+    /// CHECK: Winner account is only used for PDA derivation
+    pub winner: AccountInfo<'info>,
+    /// CHECK: Recipient receives the closed account's rent
+    #[account(mut)]
+    pub recipient: AccountInfo<'info>,
 }
