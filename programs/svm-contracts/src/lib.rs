@@ -193,7 +193,13 @@ pub mod svm_contracts {
         Ok(())
     }
 
-    pub fn send_reward(ctx: Context<SendReward>, reward_amount: u64) -> Result<()> {
+    pub fn send_reward(
+        ctx: Context<SendReward>,
+        main_winner_amount: u64,
+        referrer_winners: Vec<Pubkey>,
+        referrer_amounts: Vec<u64>,
+        skip_claimed_check: bool,
+    ) -> Result<()> {
         require!(
             !ctx.accounts.global_state.paused,
             CustomError::ContractPaused
@@ -203,10 +209,26 @@ pub mod svm_contracts {
             CustomError::UnauthorizedRewardAction
         );
 
+        // Validate referrer lists match
+        require!(
+            referrer_winners.len() == referrer_amounts.len(),
+            CustomError::InvalidReferrerData
+        );
+
+        // Calculate total reward amount
+        let referrer_total: u64 = referrer_amounts.iter().sum();
+        let total_reward_amount = main_winner_amount
+            .checked_add(referrer_total)
+            .ok_or(CustomError::InvalidRewardAmount)?;
+
+        // Store values before mutable borrow
+        let quest_key = ctx.accounts.quest.key();
+        let quest_token_mint = ctx.accounts.quest.token_mint;
+
         let quest = &mut ctx.accounts.quest;
         require!(quest.is_active, CustomError::QuestNotActive);
         require!(
-            quest.total_reward_distributed + reward_amount <= quest.amount,
+            quest.total_reward_distributed + total_reward_amount <= quest.amount,
             CustomError::InsufficientRewardBalance
         );
         require!(
@@ -214,11 +236,10 @@ pub mod svm_contracts {
             CustomError::MaxWinnersReached
         );
 
-        // Validate winner token account (ATA) exists and is correct
-        // This provides clear error messages for missing ATAs before attempting transfer
+        // Validate main winner token account (ATA) exists and is correct
         let winner_token = &ctx.accounts.winner_token_account;
         require!(
-            winner_token.mint == quest.token_mint,
+            winner_token.mint == quest_token_mint,
             CustomError::MissingAssociatedTokenAccount
         );
         require!(
@@ -226,33 +247,132 @@ pub mod svm_contracts {
             CustomError::MissingAssociatedTokenAccount
         );
 
-        // Check if winner has already claimed reward
+        // Validate referrer token accounts from remaining_accounts
+        require!(
+            ctx.remaining_accounts.len() == referrer_winners.len(),
+            CustomError::InvalidReferrerAccounts
+        );
+
+        // Check if main winner has already claimed reward (only if skip_claimed_check is false)
         let reward_claimed_pda = &mut ctx.accounts.reward_claimed;
-        require!(!reward_claimed_pda.claimed, CustomError::AlreadyRewarded);
+        if !skip_claimed_check {
+            require!(!reward_claimed_pda.claimed, CustomError::AlreadyRewarded);
+        }
 
         // Update quest state
-        quest.total_reward_distributed += reward_amount;
-        quest.total_winners += 1;
+        quest.total_reward_distributed += total_reward_amount;
+        // Only increment total_winners if this is the first time claiming for this winner
+        if !reward_claimed_pda.claimed {
+            quest.total_winners += 1;
+        }
 
-        // Initialize reward claimed account
-        // Note: quest.id is String, but RewardClaimed.quest stores Pubkey for consistency
-        reward_claimed_pda.quest = ctx.accounts.quest.key(); // Using quest.key() (Pubkey) instead of quest.id (String)
+        // Initialize or update reward claimed account for main winner
+        reward_claimed_pda.quest = quest_key;
         reward_claimed_pda.winner = ctx.accounts.winner.key();
-        reward_claimed_pda.reward_amount = reward_amount;
+        reward_claimed_pda.reward_amount += main_winner_amount; // Accumulate reward amount for multiple sends
         reward_claimed_pda.claimed = true;
 
-        // Transfer reward tokens from escrow to winner
         let signer_seeds: &[&[&[u8]]] = &[&[GLOBAL_STATE_SEED, &[ctx.bumps.global_state]]];
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.escrow_account.to_account_info(),
-                to: ctx.accounts.winner_token_account.to_account_info(),
-                authority: ctx.accounts.global_state.to_account_info(),
-            },
-            signer_seeds,
-        );
-        token::transfer(transfer_ctx, reward_amount)?;
+
+        // Transfer reward tokens from escrow to main winner
+        if main_winner_amount > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.escrow_account.to_account_info(),
+                        to: ctx.accounts.winner_token_account.to_account_info(),
+                        authority: ctx.accounts.global_state.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                main_winner_amount,
+            )?;
+        }
+
+        // Transfer reward tokens to each referrer
+        // Note: Due to Anchor's Context lifetime constraints, we need to extract account infos
+        // in a way that the borrow checker accepts. We do this by ensuring all operations
+        // happen in a single expression where possible.
+        for (i, amount) in referrer_amounts.iter().enumerate() {
+            if *amount > 0 {
+                let referrer_pubkey = &referrer_winners[i];
+
+                // Validate referrer token account
+                {
+                    let referrer_token_account_info = &ctx.remaining_accounts[i];
+                    let account_data = referrer_token_account_info.try_borrow_data()?;
+                    if account_data.len() < 72 {
+                        return Err(CustomError::MissingAssociatedTokenAccount.into());
+                    }
+                    let account_mint = Pubkey::try_from(&account_data[0..32])
+                        .map_err(|_| CustomError::MissingAssociatedTokenAccount)?;
+                    let account_owner = Pubkey::try_from(&account_data[32..64])
+                        .map_err(|_| CustomError::MissingAssociatedTokenAccount)?;
+
+                    require!(
+                        account_mint == quest_token_mint,
+                        CustomError::MissingAssociatedTokenAccount
+                    );
+                    require!(
+                        account_owner == *referrer_pubkey,
+                        CustomError::MissingAssociatedTokenAccount
+                    );
+                }
+
+                // Extract account infos and perform transfer
+                // Note: Due to Anchor's lifetime system, AccountInfo from remaining_accounts
+                // and accounts have incompatible lifetimes. We work around this by cloning
+                // AccountInfo values and using them immediately together.
+                {
+                    // SAFETY: AccountInfo is essentially a pointer wrapper containing:
+                    // - key: Pubkey (Copy type)
+                    // - lamports: Rc<RefCell<&'a mut u64>> (reference counted)
+                    // - data: Rc<RefCell<&'a mut [u8]>> (reference counted)
+                    // - owner: Pubkey (Copy type)
+                    // - executable: bool (Copy type)
+                    // - rent_epoch: u64 (Copy type)
+                    //
+                    // At runtime, the lifetimes don't matter since AccountInfo uses Rc (reference counting)
+                    // for shared ownership. We clone from both sources and use them immediately together,
+                    // which is safe because:
+                    // 1. We've already validated the account data above
+                    // 2. All AccountInfo values are used synchronously in the same CPI call
+                    // 3. The underlying account data remains valid for the duration of the instruction
+                    //
+                    // The transmute is necessary to satisfy Rust's type system which sees incompatible
+                    // lifetimes, but at runtime AccountInfo is just pointers/references that are valid
+                    // for the entire instruction execution.
+                    let to_account = ctx.remaining_accounts[i].clone();
+                    let from_account = ctx.accounts.escrow_account.to_account_info();
+                    let program_account = ctx.accounts.token_program.to_account_info();
+                    let auth_account = ctx.accounts.global_state.to_account_info();
+
+                    // SAFETY: We transmute AccountInfo<'a> to AccountInfo<'b> to unify lifetimes.
+                    // This is safe because:
+                    // 1. AccountInfo uses Rc for shared ownership, so the underlying data persists
+                    // 2. All accounts are valid for the entire instruction execution
+                    // 3. We use the AccountInfo values immediately in the CPI call
+                    // 4. We've validated the account structure and ownership above
+                    unsafe {
+                        // Transmute the lifetime parameter only - the actual data structure is unchanged
+                        let to_account_unified: AccountInfo = std::mem::transmute_copy(&to_account);
+                        token::transfer(
+                            CpiContext::new_with_signer(
+                                program_account,
+                                Transfer {
+                                    from: from_account,
+                                    to: to_account_unified,
+                                    authority: auth_account,
+                                },
+                                signer_seeds,
+                            ),
+                            *amount,
+                        )?;
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -374,6 +494,12 @@ pub enum CustomError {
     RewardNotClaimed,
     #[msg("Unauthorized to close this reward claimed account")]
     UnauthorizedClosure,
+    #[msg("Referrer winners and amounts lists must have the same length")]
+    InvalidReferrerData,
+    #[msg("Invalid reward amount (overflow detected)")]
+    InvalidRewardAmount,
+    #[msg("Number of referrer accounts does not match number of referrer winners")]
+    InvalidReferrerAccounts,
 }
 
 #[derive(Accounts)]
@@ -515,7 +641,7 @@ pub struct SendReward<'info> {
     )]
     pub winner_token_account: Account<'info, TokenAccount>,
     #[account(
-        init,
+        init_if_needed,
         payer = owner,
         space = REWARD_CLAIMED_SPACE,
         seeds = [b"reward_claimed", quest.key().as_ref(), winner.key().as_ref()],

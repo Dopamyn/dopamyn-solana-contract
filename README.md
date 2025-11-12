@@ -256,6 +256,7 @@ pub struct RewardClaimed {
    - Token transfers use secure CPI calls
 
 3. **State Management**
+
    - Quest state transitions are strictly controlled
    - Deadline checks prevent early withdrawals
    - Pausing mechanism for emergency stops

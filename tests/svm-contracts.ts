@@ -730,7 +730,7 @@ describe("svm-contracts", () => {
           .rpc();
       });
 
-      it("should allow owner to send reward", async () => {
+      it("should allow owner to send reward to main winner only", async () => {
         const [rewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
           [
             Buffer.from("reward_claimed"),
@@ -749,7 +749,7 @@ describe("svm-contracts", () => {
         ).amount;
 
         await program.methods
-          .sendReward(rewardAmount)
+          .sendReward(rewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -803,6 +803,184 @@ describe("svm-contracts", () => {
         expect(rewardClaimed.claimed).to.be.true;
       });
 
+      it("should allow owner to send reward with referrers", async () => {
+        // Create a new quest for referrer test
+        const referrerQuestKeypair = Keypair.generate();
+        const [referrerEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), referrerQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const referrerQuestAmount = new anchor.BN(1000000);
+        const referrerDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+
+        await program.methods
+          .createQuest("referrer-test-quest", referrerQuestAmount, referrerDeadline, 10)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: referrerEscrowPDA,
+            creatorTokenAccount: creatorTokenAccount,
+            quest: referrerQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, referrerQuestKeypair])
+          .rpc();
+
+        // Create main winner
+        const mainWinner = Keypair.generate();
+        await airdropIfNeeded(mainWinner.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+        const mainWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          mainWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, mainWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            mainWinner.publicKey,
+            mainWinnerTokenAccount,
+            mainWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [mainWinner]);
+        }
+
+        // Create referrers
+        const referrer1 = Keypair.generate();
+        const referrer2 = Keypair.generate();
+        await airdropIfNeeded(referrer1.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+        await airdropIfNeeded(referrer2.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+
+        const referrer1TokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          referrer1.publicKey
+        );
+        const referrer2TokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          referrer2.publicKey
+        );
+
+        // Create referrer ATAs
+        try {
+          await getAccount(provider.connection, referrer1TokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            referrer1.publicKey,
+            referrer1TokenAccount,
+            referrer1.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [referrer1]);
+        }
+
+        try {
+          await getAccount(provider.connection, referrer2TokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            referrer2.publicKey,
+            referrer2TokenAccount,
+            referrer2.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [referrer2]);
+        }
+
+        const [referrerRewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("reward_claimed"),
+            referrerQuestKeypair.publicKey.toBuffer(),
+            mainWinner.publicKey.toBuffer(),
+          ],
+          program.programId
+        );
+
+        // Get balances before reward
+        const mainWinnerBalanceBefore = (
+          await getAccount(provider.connection, mainWinnerTokenAccount)
+        ).amount;
+        const referrer1BalanceBefore = (
+          await getAccount(provider.connection, referrer1TokenAccount)
+        ).amount;
+        const referrer2BalanceBefore = (
+          await getAccount(provider.connection, referrer2TokenAccount)
+        ).amount;
+        const escrowBalanceBefore = (
+          await getAccount(provider.connection, referrerEscrowPDA)
+        ).amount;
+
+        const mainWinnerAmount = new anchor.BN(500000);
+        const referrer1Amount = new anchor.BN(100000);
+        const referrer2Amount = new anchor.BN(50000);
+        const totalReward = mainWinnerAmount.add(referrer1Amount).add(referrer2Amount);
+
+        // Send reward with referrers
+        await program.methods
+          .sendReward(
+            mainWinnerAmount,
+            [referrer1.publicKey, referrer2.publicKey],
+            [referrer1Amount, referrer2Amount],
+            false
+          )
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: referrerQuestKeypair.publicKey,
+            escrowAccount: referrerEscrowPDA,
+            winner: mainWinner.publicKey,
+            winnerTokenAccount: mainWinnerTokenAccount,
+            rewardClaimed: referrerRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .remainingAccounts([
+            { pubkey: referrer1TokenAccount, isWritable: true, isSigner: false },
+            { pubkey: referrer2TokenAccount, isWritable: true, isSigner: false },
+          ])
+          .signers([owner])
+          .rpc();
+
+        // Get balances after reward
+        const mainWinnerBalanceAfter = (
+          await getAccount(provider.connection, mainWinnerTokenAccount)
+        ).amount;
+        const referrer1BalanceAfter = (
+          await getAccount(provider.connection, referrer1TokenAccount)
+        ).amount;
+        const referrer2BalanceAfter = (
+          await getAccount(provider.connection, referrer2TokenAccount)
+        ).amount;
+        const escrowBalanceAfter = (
+          await getAccount(provider.connection, referrerEscrowPDA)
+        ).amount;
+        const quest = await program.account.quest.fetch(referrerQuestKeypair.publicKey);
+
+        // Verify token transfers
+        expect(mainWinnerBalanceAfter.toString()).to.equal(
+          (mainWinnerBalanceBefore + BigInt(mainWinnerAmount.toString())).toString()
+        );
+        expect(referrer1BalanceAfter.toString()).to.equal(
+          (referrer1BalanceBefore + BigInt(referrer1Amount.toString())).toString()
+        );
+        expect(referrer2BalanceAfter.toString()).to.equal(
+          (referrer2BalanceBefore + BigInt(referrer2Amount.toString())).toString()
+        );
+        expect(escrowBalanceAfter.toString()).to.equal(
+          (escrowBalanceBefore - BigInt(totalReward.toString())).toString()
+        );
+
+        // Verify quest state
+        expect(quest.totalRewardDistributed.toString()).to.equal(totalReward.toString());
+        expect(quest.totalWinners.toString()).to.equal("1");
+      });
+
       it("should not allow sending reward when contract is paused", async () => {
         // Pause the contract
         await program.methods
@@ -826,7 +1004,7 @@ describe("svm-contracts", () => {
 
         try {
           await program.methods
-            .sendReward(rewardAmount)
+            .sendReward(rewardAmount, [], [], false)
             .accounts({
               owner: owner.publicKey,
               globalState: globalStatePDA,
@@ -875,7 +1053,7 @@ describe("svm-contracts", () => {
 
         try {
           await program.methods
-            .sendReward(rewardAmount)
+            .sendReward(rewardAmount, [], [], false)
             .accounts({
               owner: nonOwner.publicKey,
               globalState: globalStatePDA,
@@ -907,7 +1085,7 @@ describe("svm-contracts", () => {
 
         try {
           await program.methods
-            .sendReward(rewardAmount)
+            .sendReward(rewardAmount, [], [], false)
             .accounts({
               owner: owner.publicKey,
               globalState: globalStatePDA,
@@ -925,6 +1103,290 @@ describe("svm-contracts", () => {
         } catch (error) {
           expect(error).to.exist;
         }
+      });
+
+      it("should not allow mismatched referrer winners and amounts", async () => {
+        const testQuestKeypair = Keypair.generate();
+        const [testEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), testQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const testQuestAmount = new anchor.BN(1000000);
+        const testDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+
+        await program.methods
+          .createQuest("mismatch-test", testQuestAmount, testDeadline, 10)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: testEscrowPDA,
+            creatorTokenAccount: creatorTokenAccount,
+            quest: testQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, testQuestKeypair])
+          .rpc();
+
+        const testWinner = Keypair.generate();
+        await airdropIfNeeded(testWinner.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+        const testWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          testWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, testWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            testWinner.publicKey,
+            testWinnerTokenAccount,
+            testWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [testWinner]);
+        }
+
+        const [testRewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("reward_claimed"),
+            testQuestKeypair.publicKey.toBuffer(),
+            testWinner.publicKey.toBuffer(),
+          ],
+          program.programId
+        );
+
+        const referrer1 = Keypair.generate();
+        // Mismatch: 1 referrer but 2 amounts
+        try {
+          await program.methods
+            .sendReward(
+              new anchor.BN(100000),
+              [referrer1.publicKey],
+              [new anchor.BN(10000), new anchor.BN(5000)],
+              false
+            )
+            .accounts({
+              owner: owner.publicKey,
+              globalState: globalStatePDA,
+              quest: testQuestKeypair.publicKey,
+              escrowAccount: testEscrowPDA,
+              winner: testWinner.publicKey,
+              winnerTokenAccount: testWinnerTokenAccount,
+              rewardClaimed: testRewardClaimedPDA,
+              tokenProgram: TOKEN_PROGRAM_ID,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([owner])
+            .rpc();
+          expect.fail("Expected the transaction to fail");
+        } catch (error) {
+          expect(error).to.exist;
+        }
+      });
+
+      it("should not allow invalid referrer token account", async () => {
+        const testQuestKeypair = Keypair.generate();
+        const [testEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), testQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const testQuestAmount = new anchor.BN(1000000);
+        const testDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+
+        await program.methods
+          .createQuest("invalid-referrer-test", testQuestAmount, testDeadline, 10)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: testEscrowPDA,
+            creatorTokenAccount: creatorTokenAccount,
+            quest: testQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, testQuestKeypair])
+          .rpc();
+
+        const testWinner = Keypair.generate();
+        await airdropIfNeeded(testWinner.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+        const testWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          testWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, testWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            testWinner.publicKey,
+            testWinnerTokenAccount,
+            testWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [testWinner]);
+        }
+
+        const [testRewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("reward_claimed"),
+            testQuestKeypair.publicKey.toBuffer(),
+            testWinner.publicKey.toBuffer(),
+          ],
+          program.programId
+        );
+
+        const referrer1 = Keypair.generate();
+        // Use wrong token account (main winner's account instead of referrer's)
+        try {
+          await program.methods
+            .sendReward(
+              new anchor.BN(100000),
+              [referrer1.publicKey],
+              [new anchor.BN(10000)],
+              false
+            )
+            .accounts({
+              owner: owner.publicKey,
+              globalState: globalStatePDA,
+              quest: testQuestKeypair.publicKey,
+              escrowAccount: testEscrowPDA,
+              winner: testWinner.publicKey,
+              winnerTokenAccount: testWinnerTokenAccount,
+              rewardClaimed: testRewardClaimedPDA,
+              tokenProgram: TOKEN_PROGRAM_ID,
+              systemProgram: SystemProgram.programId,
+            })
+            .remainingAccounts([
+              { pubkey: testWinnerTokenAccount, isWritable: true, isSigner: false }, // Wrong account
+            ])
+            .signers([owner])
+            .rpc();
+          expect.fail("Expected the transaction to fail");
+        } catch (error) {
+          expect(error).to.exist;
+        }
+      });
+
+      it("should allow skip_claimed_check to send multiple rewards to same winner", async () => {
+        const testQuestKeypair = Keypair.generate();
+        const [testEscrowPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("escrow"), testQuestKeypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const testQuestAmount = new anchor.BN(1000000);
+        const testDeadline = new anchor.BN(Date.now() / 1000 + 86400);
+
+        await program.methods
+          .createQuest("skip-check-test", testQuestAmount, testDeadline, 10)
+          .accounts({
+            creator: owner.publicKey,
+            globalState: globalStatePDA,
+            tokenMint: supportedTokenMint.publicKey,
+            escrowAccount: testEscrowPDA,
+            creatorTokenAccount: creatorTokenAccount,
+            quest: testQuestKeypair.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .signers([owner, testQuestKeypair])
+          .rpc();
+
+        const testWinner = Keypair.generate();
+        await airdropIfNeeded(testWinner.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
+        const testWinnerTokenAccount = await getAssociatedTokenAddress(
+          supportedTokenMint.publicKey,
+          testWinner.publicKey
+        );
+
+        try {
+          await getAccount(provider.connection, testWinnerTokenAccount);
+        } catch (error) {
+          const createATAInstruction = createAssociatedTokenAccountInstruction(
+            testWinner.publicKey,
+            testWinnerTokenAccount,
+            testWinner.publicKey,
+            supportedTokenMint.publicKey
+          );
+          const transaction = new Transaction().add(createATAInstruction);
+          await provider.sendAndConfirm(transaction, [testWinner]);
+        }
+
+        const [testRewardClaimedPDA] = anchor.web3.PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("reward_claimed"),
+            testQuestKeypair.publicKey.toBuffer(),
+            testWinner.publicKey.toBuffer(),
+          ],
+          program.programId
+        );
+
+        const firstReward = new anchor.BN(100000);
+        const secondReward = new anchor.BN(50000);
+
+        // First reward
+        await program.methods
+          .sendReward(firstReward, [], [], false)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: testQuestKeypair.publicKey,
+            escrowAccount: testEscrowPDA,
+            winner: testWinner.publicKey,
+            winnerTokenAccount: testWinnerTokenAccount,
+            rewardClaimed: testRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        // Second reward with skip_claimed_check = true
+        const winnerBalanceBefore = (
+          await getAccount(provider.connection, testWinnerTokenAccount)
+        ).amount;
+
+        await program.methods
+          .sendReward(secondReward, [], [], true)
+          .accounts({
+            owner: owner.publicKey,
+            globalState: globalStatePDA,
+            quest: testQuestKeypair.publicKey,
+            escrowAccount: testEscrowPDA,
+            winner: testWinner.publicKey,
+            winnerTokenAccount: testWinnerTokenAccount,
+            rewardClaimed: testRewardClaimedPDA,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+        const winnerBalanceAfter = (
+          await getAccount(provider.connection, testWinnerTokenAccount)
+        ).amount;
+        const rewardClaimed = await program.account.rewardClaimed.fetch(
+          testRewardClaimedPDA
+        );
+
+        // Verify both rewards were sent
+        expect(winnerBalanceAfter.toString()).to.equal(
+          (winnerBalanceBefore + BigInt(secondReward.toString())).toString()
+        );
+        // Verify reward amount was accumulated
+        expect(rewardClaimed.rewardAmount.toString()).to.equal(
+          firstReward.add(secondReward).toString()
+        );
       });
 
       it("should not allow reward when quest is inactive", async () => {
@@ -951,7 +1413,7 @@ describe("svm-contracts", () => {
 
         try {
           await program.methods
-            .sendReward(rewardAmount)
+            .sendReward(rewardAmount, [], [], false)
             .accounts({
               owner: owner.publicKey,
               globalState: globalStatePDA,
@@ -1404,7 +1866,7 @@ describe("svm-contracts", () => {
         );
 
         await program.methods
-          .sendReward(emptyAmount)
+          .sendReward(emptyAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -1595,7 +2057,7 @@ describe("svm-contracts", () => {
 
         // Send reward to create the RewardClaimed PDA
         await program.methods
-          .sendReward(closeRewardAmount)
+          .sendReward(closeRewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -1690,7 +2152,7 @@ describe("svm-contracts", () => {
 
         // Send reward
         await program.methods
-          .sendReward(closeRewardAmount)
+          .sendReward(closeRewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -1834,7 +2296,7 @@ describe("svm-contracts", () => {
 
         // Send reward
         await program.methods
-          .sendReward(closeRewardAmount)
+          .sendReward(closeRewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -1979,7 +2441,7 @@ describe("svm-contracts", () => {
 
         // Send reward
         await program.methods
-          .sendReward(closeRewardAmount)
+          .sendReward(closeRewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
@@ -2119,7 +2581,7 @@ describe("svm-contracts", () => {
 
         // Send reward
         await program.methods
-          .sendReward(closeRewardAmount)
+          .sendReward(closeRewardAmount, [], [], false)
           .accounts({
             owner: owner.publicKey,
             globalState: globalStatePDA,
