@@ -198,7 +198,6 @@ pub mod svm_contracts {
         main_winner_amount: u64,
         referrer_winners: Vec<Pubkey>,
         referrer_amounts: Vec<u64>,
-        skip_claimed_check: bool,
     ) -> Result<()> {
         require!(
             !ctx.accounts.global_state.paused,
@@ -253,24 +252,10 @@ pub mod svm_contracts {
             CustomError::InvalidReferrerAccounts
         );
 
-        // Check if main winner has already claimed reward (only if skip_claimed_check is false)
-        let reward_claimed_pda = &mut ctx.accounts.reward_claimed;
-        if !skip_claimed_check {
-            require!(!reward_claimed_pda.claimed, CustomError::AlreadyRewarded);
-        }
-
         // Update quest state
         quest.total_reward_distributed += total_reward_amount;
-        // Only increment total_winners if this is the first time claiming for this winner
-        if !reward_claimed_pda.claimed {
-            quest.total_winners += 1;
-        }
-
-        // Initialize or update reward claimed account for main winner
-        reward_claimed_pda.quest = quest_key;
-        reward_claimed_pda.winner = ctx.accounts.winner.key();
-        reward_claimed_pda.reward_amount += main_winner_amount; // Accumulate reward amount for multiple sends
-        reward_claimed_pda.claimed = true;
+        // Increment total_winners (double-claim prevention should be handled off-chain)
+        quest.total_winners += 1;
 
         let signer_seeds: &[&[&[u8]]] = &[&[GLOBAL_STATE_SEED, &[ctx.bumps.global_state]]];
 
@@ -356,6 +341,111 @@ pub mod svm_contracts {
                     // 4. We've validated the account structure and ownership above
                     unsafe {
                         // Transmute the lifetime parameter only - the actual data structure is unchanged
+                        let to_account_unified: AccountInfo = std::mem::transmute_copy(&to_account);
+                        token::transfer(
+                            CpiContext::new_with_signer(
+                                program_account,
+                                Transfer {
+                                    from: from_account,
+                                    to: to_account_unified,
+                                    authority: auth_account,
+                                },
+                                signer_seeds,
+                            ),
+                            *amount,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn send_referrer_rewards(
+        ctx: Context<SendReferrerRewards>,
+        referrer_winners: Vec<Pubkey>,
+        referrer_amounts: Vec<u64>,
+    ) -> Result<()> {
+        require!(
+            !ctx.accounts.global_state.paused,
+            CustomError::ContractPaused
+        );
+        require!(
+            ctx.accounts.owner.key() == ctx.accounts.global_state.owner,
+            CustomError::UnauthorizedRewardAction
+        );
+
+        // Validate referrer lists match
+        require!(
+            referrer_winners.len() == referrer_amounts.len(),
+            CustomError::InvalidReferrerData
+        );
+
+        // Prevent DoS by limiting referrer array size
+        require!(referrer_winners.len() <= 50, CustomError::TooManyReferrers);
+
+        // Calculate total referrer reward amount
+        let referrer_total: u64 = referrer_amounts.iter().sum();
+        require!(referrer_total > 0, CustomError::InvalidReferrerRewardAmount);
+
+        // Store values before mutable borrow
+        let quest_token_mint = ctx.accounts.quest.token_mint;
+
+        let quest = &mut ctx.accounts.quest;
+        require!(quest.is_active, CustomError::QuestNotActive);
+        require!(
+            quest.total_reward_distributed + referrer_total <= quest.amount,
+            CustomError::InsufficientRewardBalance
+        );
+
+        // Validate referrer token accounts from remaining_accounts
+        require!(
+            ctx.remaining_accounts.len() == referrer_winners.len(),
+            CustomError::InvalidReferrerAccounts
+        );
+
+        // Update quest state (only total_reward_distributed, NOT total_winners)
+        quest.total_reward_distributed += referrer_total;
+
+        let signer_seeds: &[&[&[u8]]] = &[&[GLOBAL_STATE_SEED, &[ctx.bumps.global_state]]];
+
+        // Transfer reward tokens to each referrer
+        for (i, amount) in referrer_amounts.iter().enumerate() {
+            if *amount > 0 {
+                let referrer_pubkey = &referrer_winners[i];
+
+                // Validate referrer token account
+                {
+                    let referrer_token_account_info = &ctx.remaining_accounts[i];
+                    let account_data = referrer_token_account_info.try_borrow_data()?;
+                    if account_data.len() < 72 {
+                        return Err(CustomError::MissingAssociatedTokenAccount.into());
+                    }
+                    let account_mint = Pubkey::try_from(&account_data[0..32])
+                        .map_err(|_| CustomError::MissingAssociatedTokenAccount)?;
+                    let account_owner = Pubkey::try_from(&account_data[32..64])
+                        .map_err(|_| CustomError::MissingAssociatedTokenAccount)?;
+
+                    require!(
+                        account_mint == quest_token_mint,
+                        CustomError::MissingAssociatedTokenAccount
+                    );
+                    require!(
+                        account_owner == *referrer_pubkey,
+                        CustomError::MissingAssociatedTokenAccount
+                    );
+                }
+
+                // Extract account infos and perform transfer
+                {
+                    let to_account = ctx.remaining_accounts[i].clone();
+                    let from_account = ctx.accounts.escrow_account.to_account_info();
+                    let program_account = ctx.accounts.token_program.to_account_info();
+                    let auth_account = ctx.accounts.global_state.to_account_info();
+
+                    // SAFETY: Same safety guarantees as in send_reward function
+                    unsafe {
                         let to_account_unified: AccountInfo = std::mem::transmute_copy(&to_account);
                         token::transfer(
                             CpiContext::new_with_signer(
@@ -500,6 +590,10 @@ pub enum CustomError {
     InvalidRewardAmount,
     #[msg("Number of referrer accounts does not match number of referrer winners")]
     InvalidReferrerAccounts,
+    #[msg("Total referrer reward amount must be > 0")]
+    InvalidReferrerRewardAmount,
+    #[msg("Too many referrers (max 50)")]
+    TooManyReferrers,
 }
 
 #[derive(Accounts)]
@@ -640,16 +734,28 @@ pub struct SendReward<'info> {
         constraint = winner_token_account.owner == winner.key()
     )]
     pub winner_token_account: Account<'info, TokenAccount>,
-    #[account(
-        init_if_needed,
-        payer = owner,
-        space = REWARD_CLAIMED_SPACE,
-        seeds = [b"reward_claimed", quest.key().as_ref(), winner.key().as_ref()],
-        bump
-    )]
-    pub reward_claimed: Account<'info, RewardClaimed>,
     pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SendReferrerRewards<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [GLOBAL_STATE_SEED],
+        bump,
+    )]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut)]
+    pub quest: Account<'info, Quest>,
+    #[account(
+        mut,
+        constraint = escrow_account.mint == quest.token_mint,
+        constraint = escrow_account.owner == global_state.key()
+    )]
+    pub escrow_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
